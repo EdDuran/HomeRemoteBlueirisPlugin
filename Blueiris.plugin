@@ -1,0 +1,568 @@
+/**
+ * Home Remote - Blue Iris Plugin
+ * (c) 2021 Keith Roberts
+ * 
+ * Plugin will syncrhonize with the Blue Iris Server and creates a Device for
+ * each BI Cameera. Groups are identified with double underscores in their
+ * Device.ID. The {Server}_Bimgmt device isn't a Camera but provides the
+ * Log attribute which can be displayed for realtime debugging. The PTZ
+ * attribute allows the Camera to be moved Up/Down/Left/Right or to preset
+ * locations.
+ *
+**/
+
+plugin.Name = "Blueiris";
+plugin.OnChangeRequest = onChangeRequest;
+plugin.OnConnect = onConnect;
+plugin.OnDisconnect = onDisconnect;
+plugin.OnPoll = onPoll;
+plugin.OnSynchronizeDevices = onSynchronizeDevices;
+plugin.PollingInterval = 10000;
+plugin.DefaultSettings = {
+	"Server" : "",			// Server name used for creating HR device names
+	"BaseURL" : "",		// Blue Iris base URL, ie http://192.168.1.100:8080
+	"Username" : "",		// Blue Iris username
+	"Password" : ""		// Blue Iris password
+};
+//
+// Device Capabilities
+//
+var CAPABILITIES = [
+	"VideoStream"
+];
+
+//
+// Camera Device Attributes
+//
+var ATTRIBUTES = [
+	"Log",					// Logging string used by the BIMGMT device
+	"Stream",				// Video stream from the camera
+	"IsPTZ",					// PTZ enabled? 
+	"IsEnabled",				// Camera enabled?
+	"IsOnline",				// Camera online?
+	"HasAudio",				// Camera have audio?
+	"ShortName",			// Blue Iris ShortName (used for Home Remote ID)
+	"PTZ",					// Up, Down, Left, Right, ZoomIn, ZoomOut, Presets
+	"ServerName",			// ServerName (source from plugin settings)
+	"CameraName"			// CameraName (source from Blue Iris)
+];
+
+var _DEBUG = true;
+var _VERSION = "1.0";
+var _LOGMAX = 10000;	// Maximum size of the log in characters; set to 0 for unlimited
+var _LOGTRIM = 1000;	// When maximum size reached, trim the log this many characters
+var _LOGGER;			// Device which provides the "Log" Attribute
+
+var _BI_REASONMAPPINGS = {
+	"missing response"						: "Expected Login response.",
+	"no matching user/pw"					: "Verify HomeRemote Plugin Settings and Blue Iris Server User configuration.",
+	"IP banned"								: "Blue Iris Server has banned the Client IP Address.",
+	"Maximum login attempts exceeded"		: "Too many failed login attempts, try again later."
+}
+
+//
+// Load plugin Settings
+//
+var _biServer;
+var _biBaseURL;
+var _biUsername;
+var _biPassword;
+
+var _httpClient = new HTTPClient();
+var _isPolled;
+var _session;
+var _loginData;
+var _startTime;
+
+function debugLog(s) {
+	// Logs a string to both the console and the device Log attribute
+	//  because the console is not available in the app.  It can also
+	//  trim the device Log to keep it from growing too large if
+	//  LOG_MAX is not 0.
+	
+	if (_DEBUG) {
+		var now = new Date();
+
+		//
+	  	// No BIConfig Server yet? Just log old-school
+	  	//
+	  	if (_biServer == null) {
+	  		console.log(">>> " + s);
+	  		return;
+	  	}
+		//
+		// LOGGER not yet defined - look up the BI MGMT Device
+		//
+		var loggerName = "BI_" + _biServer + "_BIMGMT";
+		if (_LOGGER == null) {
+			_LOGGER = plugin.Devices[loggerName];
+		}
+	
+		var duration = (now.getTime() - _startTime.getTime()) / 1000;
+		var loggerPrefix = plugin.Name.toUpperCase() + "_" + _biServer + " (" + duration + "): ";
+		var logstr = loggerPrefix + s;
+	
+		//
+		// No Logger, write to the console with "<<<" suffix
+		//
+		if (_LOGGER == null) {
+        	console.log(logstr + " <<<");
+        	return;
+		}
+		
+		//
+		// Append new msg to the Log and also write to traditional console
+		//
+		console.log(logstr);
+		
+		if (_LOGGER.Log == null) {
+			_LOGGER.Log = logstr + "\n";
+		} else {
+			_LOGGER.Log = (_LOGGER.Log).concat(logstr + "\n");
+		}
+
+		//
+		// trim the log if necessary
+		//
+		if (_LOGMAX && (_LOGGER.Log.length > _LOGMAX)) {
+		    _LOGGER.Log = _LOGGER.Log.slice(-(_LOGMAX + _LOGTRIM));
+		} 
+	} // end if debug
+}
+
+//
+// ----- Home Remote Plugin: onConnect() --------------------------------------
+//
+function onConnect() {
+	//
+	// Log message timestamp relative to when connection was made
+	//
+  	_startTime = new Date();
+	_LOGGER = null;
+	_biServer = plugin.Settings["Server"];
+	_biBaseURL = plugin.Settings["BaseURL"];
+	_biUsername = plugin.Settings["Username"];
+	_biPassword = plugin.Settings["Password"];
+	
+	debugLog(">>> onConnect() @" + _startTime + " Ver:" + _VERSION + " Server:" + _biServer + "," + _biBaseURL + " User:" + _biUsername + " Pswd:****");
+	//
+	// If login fails an exception is thrown and will
+	// be displayed only when the Plugin is added or
+	// Device Synchronization is perfromed
+	//
+	_isPolled = false;
+	_session = biLogin(_biBaseURL, _biUsername, _biPassword);
+}
+//
+// ----- Home Remote Plugin: onChangeRequest() --------------------------------
+//
+// Device Attribute Change
+//
+// PTZ : Move the camera to the requested preset
+//
+function onChangeRequest(device, attribute, value) {
+	debugLog(">>> onChangeRequest(" + device.DisplayName + ", " + attribute + ", " + value + ")");
+	if (_session != null) {
+		switch (attribute) {
+			case "PTZ":
+				biSetPTZ(device, value, _session);
+				break;
+			default:
+				break;
+		}
+	}
+}
+
+//
+// ----- Home Remote Plugin: onDisconnect() -----------------------------------
+//
+function onDisconnect() {
+	debugLog(">>> onDisconnect()");
+	//
+	// BI Logout
+	//
+	biLogout(_session);
+	
+	//
+	// Clear session flags and data
+	//
+	_isPolled = false;
+	_loginData = null;
+	_session = null;
+}
+
+//
+// ----- Home Remote Plugin: onPoll() -----------------------------------------
+//
+// Poll and create the Blue Iris Camera Devices
+//
+function onPoll() {
+	
+	if (_loginData == null) {
+		debugLog(">>> onPoll() FAILURE: Login has not been completed");
+		return;
+	}
+	
+	if (_isPolled) {
+		return;
+	}
+
+	debugLog(">>> onPoll()");
+	
+	//
+	// Get list of BI Cameras
+	//
+	var camlist = biGetCamlist(_biBaseURL, _session);
+	
+	if (camlist !== null) {
+		var len = camlist.length;
+		for (var i = 0; i < len; i++) {
+			let cam = camlist[i];
+			var camName = cam.optionDisplay;
+			var camShortName = cam.optionValue;
+			// Rename Camera Groups
+			if (camName.lastIndexOf("+", 0) == 0) {
+				camName = camName.replace("+", "__");
+				camShortName = "__" + camShortName;
+			}
+			//
+			// Process biCameras
+			// Skip DisplayName with "+" prefix. Those are Groups
+			//
+			let deviceID = "BI_" + _biServer + "_" + camShortName;
+			var biCamera = plugin.Devices[deviceID];
+			if (biCamera != null) {
+				var stream =  _biBaseURL + "/mjpg/" + cam.optionValue + "/video.mjpg" +
+					"?session=" + _session +
+					"&audio=1"  +
+					"&stream=0" +
+					"&decode=-1" +
+					"&h=1024" +
+					"&kbps=4096" +
+					"&extend=2";
+				
+				biCamera.Stream = stream;
+				biCamera.IsPTZ = cam.ptz;
+				biCamera.IsEnabled = cam.isEnabled;	
+				biCamera.IsOnline = cam.isOnline;
+				biCamera.HasAudio = cam.audio;
+				biCamera.ShortName = cam.optionValue;
+				biCamera.ServerName = _biServer;
+				biCamera.CameraName = camName;
+									
+				//debugLog(stream);
+			} else { // end if biCamera exists
+				debugLog("biCamlist: Device does not exist: " + deviceID);
+			}
+		} // end for each cam
+
+		_isPolled = true;
+
+	} // end camlist != null
+}
+
+//
+// ----- Home Remote Pluging: onSynchronizeDevices() --------------------------
+//
+function onSynchronizeDevices() {
+	debugLog(">>> onSynchronizeDevices()");
+	//
+	// biLoginData is defined if onConnect() / biLogin was successful
+	//
+	if (_loginData != null) {
+		var systemName = _loginData["system name"];
+		debugLog("Blue Iris Server System Name: " + systemName);
+
+		if (_session != null) {
+			var camlist = biGetCamlist(_biBaseURL, _session);
+			if (camlist != null) {
+				var len = camlist.length;
+				for (var i = 0; i < len; i++) {
+					let cam = camlist[i];
+					var camName = cam.optionDisplay;
+					var camShortName = cam.optionValue;
+					//
+					// Rename Camera Groups (name begins with "+" sign) ?
+					//
+					if (camName.lastIndexOf("+", 0) == 0) {
+						camName = camName.replace("+", "__");
+						camShortName = "__" + camShortName;
+					}
+					let biCamera = createBiCamera(camName, camShortName, cam.ptz);
+					debugLog("Create Device ID: " + biCamera.id);
+				}
+			}
+		}
+	} // end if biLoginData
+	
+	//
+	// Create a BI MGMT Device used for Logging
+	//
+	createBiCamera("BiMgmt", "BIMGMT", false);
+}
+
+/**
+ * Create the BI Camera
+ * 
+ * @param camName 		BI Camera Name
+ * @param camShortName 	BI Camera Short Name
+ * @param isPTZ				Defines which BI Details Template should be used
+ * @returns					The newly created Camera Device
+ */
+function createBiCamera(camName, camShortName, isPTZ) {
+	var biCamera = new Device();
+	biCamera.Id = "BI_" + _biServer + "_" + camShortName;
+	biCamera.DeviceType = "IPCamera";
+	biCamera.DisplayName = "BI_" + _biServer + "_" + camName;
+	biCamera.ServerName = _biServer;
+	biCamera.Capabilities = CAPABILITIES;
+	biCamera.Attributes = ATTRIBUTES;
+	biCamera.TileTemplate="BICameraTile.xaml";
+	if (isPTZ) {
+		biCamera.DetailsTemplate = "BICameraDetailsPTZ.xaml";
+	} else {
+		biCamera.DetailsTemplate = "BICameraDetails.xaml";
+	}
+	
+	biCamera.Log = "";
+	plugin.Devices[biCamera.Id] = biCamera;
+
+	return biCamera;
+}
+
+//
+// ============================================================================
+// Blue Iris Server API
+// ============================================================================
+//
+
+/**
+ * ----- biLogin() ------------------------------------------------------------
+ * 
+ * Log into the Blue Iris Server
+ * 
+ * @param baseURL 	Server Base URL
+ * @param username 	Server username
+ * @param password 	Server password
+ * @returns 		Session Id if successful, else null or throws an Exception
+ * 
+ * biResponse:
+ *	result : { "success" | "fail" }
+ *	session : xxxxx
+ *	data : {
+ *		auth-exempt : { true | false }
+ *		reason : {
+ *			"missing response"						- Valid response to Login
+ *			"no matching user/pw"					- Plugin Config: Unknown User or Password
+ *			"IP banned"								- Blue Iris Server: BI rejecting login by IP Address
+ *			"Maximum login attempts exceeded"		- Blue Iris Server: Too many login attempts
+ *		}
+ *	}
+ */
+function biLogin(baseURL, username, password) {
+	//
+	// First Login attempt will "fail", then try again providing the "response"
+	// value consisting of MD5( username : session : password )
+	//
+//	debugLog("biLogin()...");
+	var url = baseURL+"/json";
+	var response = postHTML(url, '{"cmd":"login"}', "fail", "missing response");
+	
+	var data = response.data;
+	var result = data.result;
+	var session = data.session;
+	
+	if (session != null) {		
+//		debugLog("BI Authenticate ...");
+		var str = username + ":" + session + ":" + password;
+		var md5response = md5(str);
+//		debugLog(".. authString=" + str + " --> MD5=" + md5response);
+		//
+		// The second login attempt, specifying the MD5 string should be successful
+		// .. IF the user/pswd is correct
+		//
+		response = postHTML(url, '{"cmd":"login","session":"' + session + '","response":"' + md5response + '"}', "success", "");
+		//
+		// Success - save the Login Data
+		// and return the session Id
+		//
+//		debugLog("Authenticate: Response = " + JSON.stringify(response));
+		data = response.data;
+//		debugLog(".. response: " + JSON.stringify(data));
+		_loginData = data.data;
+		
+		return session;
+	} else {
+		debugLog("FAILURE: biLogin failed, did not receive a session from the BI Server");
+	}
+}
+
+/**
+ * postHTML request to the BI Server. Server returns "response" containing:
+ *	data - the response data from the server
+ *	status - the html status code
+ *	statusText - the html status code text
+ *	headers - the html response headers
+ * 
+ * @param url				URL
+ * @param body 				Post Body
+ * @param expectedResult 	Expected Result
+ * @param expectedReason 	Excpeted Reason
+ * @returns 				Server Response, or throws an Exception
+ */
+function postHTML(url, body, expectedResult, expectedReason) {
+	try {
+//		debugLog("postHTML: " + url + " " + body + " Expecting: " + expectedResult + " & " + expectedReason);
+		var response = _httpClient.post(url, body);
+		handleBlueIrisResponse(response, expectedResult, expectedReason);
+		return response;
+	} catch (error) {
+		debugLog("HTML Post threw exception: " + error.message);
+		handleHttpError(error);
+	}
+}
+
+function handleBlueIrisResponse(response, expectedResult, expectedReason) {
+//	debugLog("..handleBlueIrisResponse('"+expectedResult+"','"+expectedReason+"')");
+	var biData = response.data;
+//	debugLog(".. biResponse: " + JSON.stringify(biData));
+	var result = biData.result;
+//	debugLog("Response Result = '"+result+"'");
+	var reason = biData.data["reason"];
+//	debugLog("Response Reason = '"+reason+"'");
+	//
+	// HTTP Error?
+	//
+	if (!response.data.error) {
+		//
+		// No - HTTP call was successful
+		//
+//		debugLog("Result: expected(" + expectedResult + ") actual("+result+")");
+//		debugLog("Reason: expected(" + expectedReason + ") actual("+reason+")");
+		//
+		// Is this the Result/Response we were expecting?
+		//
+		if ( (expectedResult && result !== expectedResult) || (expectedReason && reason !== expectedReason) ) {
+			//
+			// No - Log and Throw an error describing the problem
+			//
+			var authExempt = biData.data["auth-exempt"];
+			debugLog("FAILURE: biLogin#Auth, Status=" + response.statusText + "(" + response.status +") ");
+			debugLog("... authExempt:"+authExempt+ ", reason:"+reason);
+			var msg = "Blue Iris '" + _biServer + "' Connection Failed.";
+			if (authExempt) {
+				msg = msg.concat("\n* Client IP Address is exempted");
+			}
+			if (reason) {
+				msg = msg.concat("\n* " + reason);
+			}
+			msg = msg.concat("\nVerify the Plugin Settings");
+			debugLog("biLogin Failure: " + msg);
+			throw(new Error(msg));
+		}
+	} else {
+		debugLog("HTML error: " + JSON.stringify(biData));
+		handleHttpError(reason);
+	}
+}
+
+function handleHttpError(error) {
+	debugLog("handleHttpError("+error.message+")");
+	var msg = "Blue Iris '" + _biServer + "' Connection Failed.";
+	msg = msg.concat("\n* " + error.message);
+	msg = msg.concat("\nVerify the Plugin Settings");
+	throw new Error(msg);
+}
+
+/**
+ * ----- biLogout() -----------------------------------------------------------
+ * 
+ * Log out of the BI Server
+ * 
+ * @param session	Session to log out of
+ */
+function biLogout(session) {
+//	debugLog("biLogout()...");
+
+	if (session != null) {
+		var url = _biBaseURL + "/json"
+		var body = '{"cmd":"logout", "session:"' + session+'"}';
+		
+		var response = _httpClient.post(url, body);
+		if (response.data.error) {
+			debugLog("FAILURE: biLogout() response=" + JSON.stringify(response));
+		}
+	}
+}
+
+
+//	optionDisplay, optionValue, ptz, audio, isEnabled, isOnline, width, height
+//
+/**
+ * ----- biGetCamlist() -------------------------------------------------------
+ * 
+ * Get the BI Camlist. Interesting Device Attributes:
+ *	optionDisplay, optionValue, ptz, audio, isEnabled, isOnline, width, height
+ * 
+ * @param baseURL	Server URL
+ * @param session 	Login Session
+ * @returns 
+ */
+function biGetCamlist(baseURL, session) {
+//	debugLog("biGetCamlist(" + baseURL + ", " + session + ")");
+	
+	var url = baseURL + "/json"
+	var body = '{"cmd":"camlist","session":"' + session + '"}';
+	var response = _httpClient.post(url, body);
+	
+	if (!response.data.error) {
+		data = response.data;
+		result = data.result;
+		session = data.session;
+//		debugLog("...response: " + result + " " + session);
+		if (result === "success") {
+//			debugLog("SUCCESS");
+			var biCamlist = data.data;
+			var camlistJSON = JSON.stringify(biCamlist);
+//			debugLog(camlistJSON);
+			//
+			// Success - return BI Camlist
+			//
+			return biCamlist;
+		} else {
+			debugLog("FAILURE: biGetCamlist() Status=" + response.statusText + "(" + response.status +") " + JSON.stringify(response.data));
+			return null;
+		}
+	}
+}
+
+/**
+ * ----- biSetPTZ() -----------------------------------------------------------
+ * 
+ * Set BI Device PTZ Position
+ *	value { 0=Left, 1=Right, 2=Up, 3=Down }
+ *	value above 100 is an predefined camera preset position
+
+ * @param device		Device to set
+ * @param value 		PTZ Value
+ * @param session 		BI Session
+ */
+function biSetPTZ(device, value, session) {
+//	debugLog("biSetPTZ...");
+	
+	var url = _biBaseURL + "/json"
+	var shortName = device.ShortName;
+	var body = '{"cmd":"ptz","session":"' + session + '","camera":"' + shortName +'", "button":' + value + '}';
+//	debugLog(body);
+	var response = _httpClient.post(url, body);
+
+	if (!response.data.error) {
+		data = response.data;
+		result = data.result;
+		session = data.session;
+//		debugLog("...response: " + result + " " + session);
+		if (result != "success") {
+			debugLog("... FAILURE: biSetPTZ() Status=" + response.statusText + "(" + response.status +") " + JSON.stringify(response.data));
+		}
+	}
+}
